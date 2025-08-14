@@ -1,0 +1,61 @@
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidytext)
+
+# Define paths
+con <- DBI::dbConnect(duckdb::duckdb())								 # to start an in-memory database
+base_paths <- c("AML_output", "ALL_output")            # This is where the TRUST4 reports are stored; it can be a folder within a folder
+duckdb_path <- "trust4_reports_all_aml.duckdb"         # This is the path to the duckdb directory (stored locally on the computer)
+metadata_path <- "../Covariates/TARGET_covs_all_aml"   # This is the path to the metadata
+
+# Step 1: List all *_report.tsv files from both folders
+report_files <- unlist(lapply(base_paths, function(path) {
+  list.files(
+    path = path,
+    pattern = "_report\\.tsv$",
+    full.names = TRUE,
+    recursive = TRUE)}))
+
+DBI::dbExecute(con, sprintf(
+  "ATTACH '%s' AS trust4_reports_all_aml (READ_ONLY FALSE)",
+  normalizePath(duckdb_path)))
+DBI::dbExecute(con, "SET max_expression_depth TO 10000")
+
+# Helper: get sample_id from full file path
+get_sample_id <- function(file_path) {
+  base <- basename(file_path)                      # e.g., TARGET-00-BM3897-14A-01R_report.tsv
+  base <- sub("_report\\.tsv$", "", base)          # remove "_report.tsv"
+  return(base)}
+
+# Adds in whether the report file came from ALL_output or AML_output
+label_group <- function(f) {
+  if (grepl("/ALL_output/|^ALL_output(/|$)", f)) "ALL" else "AML"}
+
+report_queries <- vapply(report_files, function(f) {
+  sample_id <- get_sample_id(f)
+  grp <- label_group(f)
+  sprintf(
+    "SELECT '%s' AS sample_id, '%s' AS disease_group, * 
+     FROM read_csv_auto('%s', delim='\\t')",
+    sample_id, grp, f
+  )
+}, character(1))
+
+# Combine with UNION ALL
+union_query <- paste(report_queries, collapse = "\nUNION ALL\n")
+
+dbExecute(con, "DROP TABLE IF EXISTS combined_reports")
+DBI::dbExecute(con, paste0(
+  "CREATE OR REPLACE TABLE trust4_reports_all_aml.main.combined_reports AS ", union_query))
+DBI::dbExecute(con, sprintf(
+  "CREATE OR REPLACE TABLE trust4_reports_all_aml.main.metadata_covs AS SELECT * FROM read_csv_auto('%s')",
+  metadata_path))
+DBI::dbExecute(con, "
+  CREATE OR REPLACE TABLE trust4_reports_all_aml.main.combined_with_metadata AS
+  SELECT r.*, m.*
+  FROM trust4_reports_all_aml.main.combined_reports r
+  LEFT JOIN trust4_reports_all_aml.main.metadata_covs m
+    ON r.sample_id = m.full_sample_id")
